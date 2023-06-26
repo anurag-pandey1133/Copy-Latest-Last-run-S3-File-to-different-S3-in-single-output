@@ -1,0 +1,88 @@
+import boto3
+import pandas as pd
+import pyarrow.parquet as pq
+import io
+from collections import defaultdict
+import re
+
+def lambda_handler(event, context):
+    source_bucket_name = ''
+    source_prefix = ''
+    destination_bucket_name = ''
+    dest_folder = 'destfolder/'
+    
+    # Create clients for the source and destination AWS accounts
+    sts_client = boto3.client('sts')
+    source_role_arn = ''
+    destination_role_arn = ''
+
+    try:
+        # Assume the source IAM role
+        source_credentials = sts_client.assume_role(
+            RoleArn=source_role_arn,
+            RoleSessionName='AssumeSourceRole'
+        ) 
+        
+        credentials = source_credentials['Credentials']
+        
+        # Create the source S3 client with the assumed role credentials
+        source_s3_client = boto3.resource('s3',
+            aws_access_key_id=credentials['AccessKeyId'],
+            aws_secret_access_key=credentials['SecretAccessKey'],
+            aws_session_token=credentials['SessionToken']
+        )
+
+        # Copy the object from the source S3 bucket to the destination S3 bucket
+        source_bucket = source_s3_client.Bucket(source_bucket_name)
+        
+        # Separate objects based on their respective runs
+        run_objects = defaultdict(list)
+        for obj in source_bucket.objects.filter(Prefix=source_prefix):
+            if not obj.key.endswith('/'):
+                # extract run id from key
+                run_id = obj.key.split('-')[1]
+                run_objects[run_id].append(obj)
+        
+        # Find the latest run id
+        latest_run_id = max(run_objects.keys())
+        
+        # Get all the objects from the latest run
+        latest_run_objects = run_objects[latest_run_id]
+
+        # Create an empty DataFrame
+        df_combined = pd.DataFrame()
+
+        # Copy all objects from the latest run
+        for obj in latest_run_objects:
+            # read the parquet file into a pandas dataframe
+            buffer = io.BytesIO()
+            source_s3_client.Object(source_bucket_name, obj.key).download_fileobj(buffer)
+
+            # Reset buffer's position to the start
+            buffer.seek(0)
+        
+            # Debugging code
+            buffer_length = len(buffer.getvalue())
+            print(f"Buffer length for object {obj.key}: {buffer_length}")
+            if buffer_length == 0:
+                print(f"Object {obj.key} is empty or could not be downloaded correctly.")
+                continue
+
+            try:
+                df = pq.read_table(buffer).to_pandas()
+                df_combined = pd.concat([df_combined, df])  # append the data to the combined dataframe
+            except Exception as e:
+                print(f"Error reading Parquet file: {e}")
+                continue
+        
+        # convert the dataframe to csv and upload to the destination bucket
+        csv_buffer = io.StringIO()
+        df_combined.to_csv(csv_buffer, index=False)
+        
+        # use the latest run id as the name for the combined csv
+        csv_object_key = f"{dest_folder}combined_run_{latest_run_id}.csv"
+        source_s3_client.Object(destination_bucket_name, csv_object_key).put(Body=csv_buffer.getvalue())
+        
+        print(f'Combined object {csv_object_key} uploaded successfully')
+    except Exception as e:
+        print(f'Exception in code')
